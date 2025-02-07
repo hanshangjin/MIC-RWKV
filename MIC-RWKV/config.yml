@@ -1,0 +1,42 @@
+data_map_file: ./data/data_map.csv
+amr_path: ./data/amr_raw_data
+ckpt_path: ./ckpt
+LIST_ANTIBIOTICS: ['Cefazolin', 'Aztreonam', 'Ceftriaxone', 'Piperacillin/Tazobactam', 'Gentamicin', 'Amikacin', 'Levofloxacin', 'Ciprofloxacin', 'Ampicillin', 'Tetracycline', 'Nitrofurantoin', 'Ceftazidime', 'Cefoxitin', 'Imipenem', 'Meropenem', 'Tobramycin', 'Ampicillin/Sulbactam', 'Trimethoprim/Sulfamethoxazole', 'Cefuroxime sodium', 'Cefepime']
+ANTIBIOTIC: Cefazolin
+batch_size: 4
+lr: 0.0007
+eta_min: 0.0001
+n_layer: 6
+n_embd: 32
+n_amr: 76
+cross_hid: 64
+num_heads: 4
+vocab_size: 5
+ctx_len: 2048
+num_workers: 0
+grad_norm_clip: 1.0
+max_epochs: 200
+seed: 42
+
+# Manually defined dict mapping values to categories, ensuring that target values with only a single occurrence are removed.
+val2cls: 
+  Cefazolin: {'1': 0, '2': 1, '4': 2, '8': 3, '16': 4, '32': 5, '64': 6}
+  Aztreonam: {'1': 0, '2': 1, '4': 2, '8': 3, '16': 4, '32': 5}
+  Ceftriaxone: {'0.5': 0, '2': 1, '4': 2, '8': 3, '16': 4, '32': 5, '64': 6}
+  Piperacillin/Tazobactam: {'2': 0, '4': 1, '8': 2, '16': 3, '32': 4, '64': 5, '128': 6}
+  Gentamicin: {'0.5': 0, '1': 1, '2': 2, '4': 3, '8': 4, '16': 5}
+  Amikacin: {'4': 0, '8': 1, '16': 2, '32': 3, '64': 4}
+  Levofloxacin: {'1': 0, '2': 1, '4': 2, '8': 3}
+  Ciprofloxacin: {'0.5': 0, '1': 1, '2': 2, '4': 3}
+  Ampicillin: {'8': 0, '16': 1, '32': 2}
+  Tetracycline: {'1': 0, '2': 1, '4': 2, '8': 3, '16': 4}
+  Nitrofurantoin: {'16': 0, '32': 1, '64': 2, '128': 3}
+  Ceftazidime: {'0.5': 0, '1': 1, '2': 2, '4': 3, '8': 4, '16': 5, '32': 6}
+  Cefoxitin: {'4': 0, '8': 1, '16': 2, '32': 3}
+  Imipenem: {'0.25': 0, '0.5': 1, '1': 2, '2': 3, '4': 4, '8': 5, '16': 6}
+  Meropenem: {'0.125': 0, '1': 1, '2': 2, '4': 3, '8': 4, '16': 5}
+  Tobramycin: {'0.5': 0, '1': 1, '2': 2, '4': 3, '8': 4, '16': 5}
+  Ampicillin/Sulbactam: {'2': 0, '4': 1, '8': 2, '16': 3, '32': 4}
+  Trimethoprim/Sulfamethoxazole: {'0.5': 0, '1': 1, '2': 2, '4': 3}
+  Cefuroxime sodium: {'4': 0, '8': 1, '16': 2, '32': 3}
+  Cefepime: {'0.5': 0, '1': 1, '2': 2, '4': 3, '8': 4, '16': 5, '32': 6}
