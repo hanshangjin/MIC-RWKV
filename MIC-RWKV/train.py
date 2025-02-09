@@ -48,8 +48,6 @@ with open(f'./testset/{config.ANTIBIOTIC}_lstTest.json', 'w') as f:
 print("lstTrain: ", len(lstTrain))
 print("lstVal: ", len(lstVal))
 print("lstTest: ", len(lstTest))
-lstTrain = lstTrain[:20]
-lstVal = lstVal[:8]
 training_generator = DataGenerator(config, lstTrain)
 validation_generator = DataGenerator(config, lstVal)
 

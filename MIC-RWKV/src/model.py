@@ -1,10 +1,11 @@
 ########################################################################################################
-# This part adapted from RWKV v2-RNN Language Model - https://github.com/BlinkDL/RWKV-LM
+# The RWKV v2-RNN Language Model - https://github.com/BlinkDL/RWKV-LM
 ########################################################################################################
 
 from torch.utils.cpp_extension import load
 import math
 import numpy as np
+import os
 import logging
 import torch
 import torch.nn as nn
@@ -20,36 +21,51 @@ T_MAX = 2080          # increase this if your ctx_len > 1024
 B_GROUP_FORWARD = 4   # set to 8 for best performance
 B_GROUP_BACKWARD = 2  # set to 2 for best performance
 
-timex_cuda = load(name="timex", sources=["./MIC-RWKV/cuda/timex_op.cpp", "./MIC-RWKV/cuda/timex_cuda.cu"],
+timex_cuda = load(name="timex", sources=["./MIC-RWKV/cuda/wkv_op.cpp", "./MIC-RWKV/cuda/wkv_cuda.cu"],
                   verbose=True, extra_cuda_cflags=['--use_fast_math', '--extra-device-vectorization', f'-DTmax={T_MAX}', f'-DBF={B_GROUP_FORWARD}', f'-DBB={B_GROUP_BACKWARD}'])
+
 
 
 class TimeX(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, w, k, B, C, T, eps):
+    def forward(ctx, B, T, C, w, u, k, v):
         ctx.B = B
-        ctx.C = C
         ctx.T = T
-        assert ctx.T % 4 == 0 and ctx.T <= T_MAX and ctx.B % B_GROUP_FORWARD == 0 and ctx.B % B_GROUP_BACKWARD == 0
-        w = w.contiguous()
-        k = k.contiguous()
-        ctx.save_for_backward(w, k)
-        wk = torch.empty((B, C, T), device='cuda',
-                         memory_format=torch.contiguous_format)
-        timex_cuda.forward(w, k, wk, eps, B, C, T)
-        return wk
+        ctx.C = C
+
+        ctx.save_for_backward(w, u, k, v)
+        w = w.float().contiguous()
+        u = u.float().contiguous()
+        k = k.float().contiguous()
+        v = v.float().contiguous()
+        y = torch.empty((B, T, C), device='cuda', memory_format=torch.contiguous_format)
+        timex_cuda.forward(B, T, C, w, u, k, v, y)
+        return y
 
     @staticmethod
-    def backward(ctx, gwk):
-        assert ctx.T % 4 == 0 and ctx.T <= T_MAX and ctx.B % B_GROUP_FORWARD == 0 and ctx.B % B_GROUP_BACKWARD == 0
-        w, k = ctx.saved_tensors
-        gw = torch.empty((ctx.B, ctx.C, ctx.T), device='cuda',
-                         memory_format=torch.contiguous_format)
-        gk = torch.empty((ctx.B, ctx.C, ctx.T), device='cuda',
-                         memory_format=torch.contiguous_format)
-        timex_cuda.backward(w, k, gwk.contiguous(), gw,
-                            gk, ctx.B, ctx.C, ctx.T)
-        return (gw.sum(dim=0), gk, None, None, None, None)
+    def backward(ctx, gy):
+        B = ctx.B
+        T = ctx.T
+        C = ctx.C
+        w, u, k, v = ctx.saved_tensors
+        gw = torch.zeros((B, C), device='cuda').contiguous()
+        gu = torch.zeros((B, C), device='cuda').contiguous()
+        gk = torch.zeros((B, C, T), device='cuda').contiguous()
+        gv = torch.zeros((B, C, T), device='cuda').contiguous()
+        timex_cuda.backward(B, T, C,
+                          w.float().contiguous(),
+                          u.float().contiguous(),
+                          k.float().contiguous(),
+                          v.float().contiguous(),
+                          gy.float().contiguous(),
+                          gw, gu, gk, gv)
+        gw = gw.sum(dim=0, keepdim=True)
+        gu = gu.sum(dim=0, keepdim=True)
+        return (None, None, None, gw, gu, gk, gv)
+
+########################################################################################################
+# RWKV: RWKV Time-mix + RWKV Channel-mix
+########################################################################################################
 
 
 RWKV_K_CLAMP = 60  # e^60 = 1e26
@@ -100,9 +116,7 @@ def RWKV_Init(module, config):  # fancy initialization of all lin & emb layer in
             else:
                 nn.init.normal_(m.weight, mean=0.0, std=-scale)
 
-########################################################################################################
-# Bi-TimeMix modified from RWKV_TimeMix of RWKV v2-RNN - https://github.com/BlinkDL/RWKV-LM
-########################################################################################################
+
 class RWKV_TimeMix(nn.Module):
     def __init__(self, config, ctx_len, n_embd, attn_sz, layer_id):
         super().__init__()
@@ -156,7 +170,8 @@ class RWKV_TimeMix(nn.Module):
         self.receptance.scale_init = 0
         self.output.scale_init = 0
 
-        self.bi_mix = nn.Parameter(torch.full((1, 1, self.n_embd), 0.01))
+        self.combined_mix = nn.Parameter(torch.full((1, 1, self.n_embd), 0.01))
+
 
     def forward(self, x):
         B, T, C = x.size()
@@ -165,35 +180,22 @@ class RWKV_TimeMix(nn.Module):
         x_t_minus_1_half = x_t_minus_1[:, :, :C//2]
         x_t_plus_1_half = x_t_plus_1[:, :, C//2:]
 
-        x_bi = torch.cat([x_t_minus_1_half, x_t_plus_1_half], dim=-1)
+        x_combined = torch.cat([x_t_minus_1_half, x_t_plus_1_half], dim=-1)
 
-        x = x * self.time_mix + self.time_shift(x) * (1 - self.time_mix) + x_bi * self.bi_mix
-
+        x = x * self.time_mix + self.time_shift(x) * (1 - self.time_mix) + x_combined * self.combined_mix
 
         k = self.key(x).transpose(-1, -2)
         v = self.value(x).transpose(-1, -2)
         r = self.receptance(x)
 
-        # RWKV_K_CLAMP can be removed if the CUDA kernel substracts the correct k_max for each k (I will do this later)
         k = torch.clamp(k, max=RWKV_K_CLAMP)
         k = torch.exp(k)
-        kv = k * v
-
-        self.time_w = torch.cat(
-            [torch.exp(self.time_decay) * self.time_curve, self.time_first], dim=-1)
-        w = torch.exp(self.time_w)
-
-        wkv = TimeX.apply(w, kv, B, C, T, 0)
-        # RWKV_K_EPS can be removed if the CUDA kernel sets 0/0 = 0 (I will do this later)
-        wk = TimeX.apply(w, k, B, C, T, RWKV_K_EPS)
-
-        rwkv = torch.sigmoid(r) * (wkv / wk).transpose(-1, -2)
+        wkv = TimeX.apply(B, T, C, self.time_decay.transpose(-1, -2) / T, self.time_first.transpose(-1, -2) / T, k, v)
+        rwkv = torch.sigmoid(r) * wkv
         rwkv = self.output(rwkv)
         return rwkv
 
-########################################################################################################
-# Adapted from RWKV_ChannelMix of RWKV v2-RNN - https://github.com/BlinkDL/RWKV-LM
-########################################################################################################
+
 class RWKV_ChannelMix(nn.Module):
     def __init__(self, n_embd, layer_id):
         super().__init__()
@@ -216,16 +218,16 @@ class RWKV_ChannelMix(nn.Module):
         self.value.scale_init = 0
         self.receptance.scale_init = 0
 
-        self.bi_mix = nn.Parameter(torch.full((1, 1, self.n_embd), 0.01))
+        self.combined_mix = nn.Parameter(torch.full((1, 1, self.n_embd), 0.01))
     def forward(self, x):
         B, T, C = x.size()
         x_t_minus_1 = torch.cat([torch.zeros(B, 1, C, device='cuda'), x[:, :-1, :]], dim=1)
         x_t_plus_1 = torch.cat([x[:, 1:, :], torch.zeros(B, 1, C, device='cuda')], dim=1)
         x_t_minus_1_half = x_t_minus_1[:, :, :C//2]
         x_t_plus_1_half = x_t_plus_1[:, :, C//2:]
-        x_bi = torch.cat([x_t_minus_1_half, x_t_plus_1_half], dim=-1)
+        x_combined = torch.cat([x_t_minus_1_half, x_t_plus_1_half], dim=-1)
 
-        x = x * self.time_mix + self.time_shift(x) * (1 - self.time_mix) + x_bi * self.bi_mix
+        x = x * self.time_mix + self.time_shift(x) * (1 - self.time_mix) + x_combined * self.combined_mix
 
         k = self.key(x)
         k = torch.square(torch.relu(k))
@@ -234,9 +236,7 @@ class RWKV_ChannelMix(nn.Module):
         rkv = torch.sigmoid(self.receptance(x)) * kv
         return rkv
 
-########################################################################################################
-# Bi-RWKV block
-########################################################################################################
+
 class Block(nn.Module):
     def __init__(self, config, layer_id, mode):
         super().__init__()
@@ -255,6 +255,7 @@ class Block(nn.Module):
             self.ffn = RWKV_ChannelMix(config.cross_hid, layer_id)
         else:
             raise ValueError(f"mode {mode} not supported")
+
 
     def forward(self, x):
         x = self.ln1(x)
@@ -308,9 +309,7 @@ class LabelSmoothingLoss(torch.nn.Module):
         loss = -torch.sum(log_probs * smoothed_labels, dim=-1).mean()
         return loss
     
-########################################################################################################
-# Adapted from GPT of RWKV v2-RNN - https://github.com/BlinkDL/RWKV-LM
-########################################################################################################
+
 class MIC_RWKV(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -336,6 +335,10 @@ class MIC_RWKV(nn.Module):
             torch.ones(config.ctx_len, config.ctx_len)))
 
         self.ctx_len = config.ctx_len
+
+
+        logger.info("number of parameters: %e", sum(p.numel()
+                    for p in self.parameters()))
         
         self.ln_flatten = nn.Sequential(nn.Linear(config.ctx_len, 128), nn.Dropout(0.5), nn.Linear(128, num_cls))
         self.ln_mapping = nn.Sequential(nn.Linear(config.ctx_len, config.cross_hid * 2), nn.ReLU(), nn.Dropout(0.5), nn.Linear(config.cross_hid * 2, config.cross_hid))
@@ -349,26 +352,20 @@ class MIC_RWKV(nn.Module):
         self.global_attn = GlobalAttention(config, config.ctx_len)
         self.criterion = LabelSmoothingLoss(num_cls, smoothing=0.1)
 
-        logger.info("number of parameters: %e", sum(p.numel()
-                    for p in self.parameters()))
-
         RWKV_Init(self, config)
 
 
     def forward(self, idx, targets, mask=None, num_seq_mask=None):
         self.step += 1
         B, n_amr, T = idx.size()
+        assert T <= self.ctx_len, "Cannot forward, because len(input) > model ctx_len."
 
         # intra
         intra_amr_atten = torch.zeros(B, n_amr, T).to(idx.device)
         for i in range(B):
-            
             x = self.emb(idx[i])
-
             x = self.blocks(x)
-
             x = self.ln_out(x)
-
             q = self.head_q(x)[:, :T, :]
             k = self.head_k(x)[:, :T, :]
             c = (q @ k.transpose(-2, -1)) * (1.0 / RWKV_HEAD_QK_DIM)
@@ -395,14 +392,13 @@ class MIC_RWKV(nn.Module):
             sub_attn = F.softmax(sub_attn, dim=-1)
             softmax_attn[b, :sum_mask, :sum_mask] = sub_attn
         weighted_x = softmax_attn @ intra_amr_atten
-
         # global
         g_attn = self.global_attn(weighted_x)
         weighted_x = weighted_x + g_attn
         weighted_x = torch.max(weighted_x, dim=1)[0]
         output = self.ln_flatten(weighted_x)
 
-        cls_loss = self.criterion(output, targets)
+        loss = self.criterion(output, targets)
 
         contrastive_loss = 0
         for b1 in range(B):
@@ -411,7 +407,7 @@ class MIC_RWKV(nn.Module):
                 contrastive_loss += self.contra_loss(weighted_x[b1], weighted_x[b2], torch.tensor(label, dtype=torch.float))
         contrastive_loss /= B * (B - 1) / 2
 
-        return weighted_x, output, cls_loss, contrastive_loss
+        return weighted_x, output, loss, contrastive_loss
 
 
 
